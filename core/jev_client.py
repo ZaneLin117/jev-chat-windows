@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Jev 判断 API 客户端：OpenRouter 或 TypeSafe 直连。
+"""Jev 判断 API 客户端：Bocha、OpenRouter 或 TypeSafe 直连。
 
-TypeSafe 直连走官方 `typesafe_sdk`；OpenRouter 这条是唯一自己拼 HTTP 的路——
-SDK 把路径写死成 `/v1/systemone`，打不到 OpenRouter 的 `/api/alpha/decisions`。
-两条路返回同一个 dict 形状，engine 不关心跑的是哪条。key 只从环境变量读，绝不打进日志。
+TypeSafe 直连走官方 `typesafe_sdk`；Bocha 和 OpenRouter 走各自 HTTP 端点。
+各来源返回同一个 dict 形状，engine 不关心跑的是哪条。key 只从环境变量读，绝不打进日志。
 """
 
 from __future__ import annotations
@@ -12,15 +11,17 @@ import json
 import os
 import socket
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import urllib.error
 import urllib.request
 from typing import NoReturn
 
 try:  # 当模块导入 / 当脚本直接跑 都能用
-    from .providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LEGACY,
+    from .providers import (BOCHA_JEV_BASE, ENV_VARS, JEV_ENV, JEV_PROVIDERS, LEGACY,
                             OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
 except ImportError:
-    from providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LEGACY,
+    from providers import (BOCHA_JEV_BASE, ENV_VARS, JEV_ENV, JEV_PROVIDERS, LEGACY,
                            OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
 
 MAX_RETRIES = 3
@@ -86,18 +87,76 @@ def _error_body(exc: urllib.error.HTTPError) -> str:
 
 
 def ask(state: dict, questions: dict, timeout: float = 20,
-        provider: str = "openrouter", model: str | None = None) -> dict:
+        provider: str = "bocha", model: str | None = None) -> dict:
     """问 Jev 一轮判断，返回 {"answers": {名字: 答案}, "usage": {...}}。
 
-    provider ∈ JEV_PROVIDERS（openrouter / typesafe 直连）；model=None 用该来源的默认模型。
-    两条路返回的 dict 形状一模一样，429/529 都会退避重试。绝不打印或写出 key。
+    provider ∈ JEV_PROVIDERS（bocha / openrouter / typesafe）；model=None 用该来源的默认模型。
+    各来源返回的 dict 形状一模一样。绝不打印或写出 key。
     """
-    spec = JEV_PROVIDERS.get(provider) or JEV_PROVIDERS["openrouter"]
-    key = _api_key(JEV_ENV)  # 两家共用同一把 key，换来源不用重填
+    if provider not in JEV_PROVIDERS:
+        provider = "bocha"
+    spec = JEV_PROVIDERS[provider]
+    key = _api_key(JEV_ENV)  # 各来源共用同一个配置槽，切换时须填所选服务商的 key
     model = model or spec.default
     if provider == "typesafe":
         return _ask_typesafe(state, questions, key, model, timeout)
+    if provider == "bocha":
+        return _ask_bocha(state, questions, key, model, timeout)
     return _ask_openrouter(state, questions, key, model, timeout)
+
+
+def _bocha_request(path: str, key: str, timeout: float, payload: dict | None = None) -> dict:
+    """Bocha Jev 的 JSON API；只对服务繁忙作有限重试，不重试无效密钥和请求。"""
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    for attempt in range(3):
+        req = urllib.request.Request(
+            BOCHA_JEV_BASE + path,
+            data=data,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            method="POST" if data is not None else "GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                result = json.load(resp)
+            if not isinstance(result, dict):
+                raise JevError("Bocha Jev 返回了无效 JSON 对象")
+            return result
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            if status in (429, 503, 529) and attempt < 2:
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                try:
+                    delay = float(retry_after)
+                except (TypeError, ValueError):
+                    try:
+                        until = parsedate_to_datetime(retry_after)
+                        delay = (until - datetime.now(timezone.utc)).total_seconds()
+                    except (TypeError, ValueError, OverflowError):
+                        delay = float(2 ** attempt)
+                delay = min(5.0, max(0.0, delay))
+                time.sleep(delay)
+                continue
+            detail = _error_body(exc).replace(key, "[REDACTED]")
+            hint = {401: "密钥被拒", 413: "请求过大", 422: "请求格式或输入超限",
+                    429: "被限流", 503: "服务暂不可用", 529: "服务过载"}.get(status, "")
+            raise JevError(f"Bocha Jev HTTP {status}: {hint or detail or '请求失败'}", status) from None
+        except (TimeoutError, socket.timeout):
+            raise JevError(f"Bocha Jev 请求超时（{timeout}s）") from None
+        except urllib.error.URLError as exc:
+            reason = redact_secrets(getattr(exc, "reason", exc)).replace(key, "[REDACTED]")
+            raise JevError(f"Bocha Jev 网络失败: {reason}") from None
+        except (ValueError, UnicodeError):
+            raise JevError("Bocha Jev 返回了无效 JSON") from None
+    raise JevError("Bocha Jev 重试后仍不可用")
+
+
+def _ask_bocha(state: dict, questions: dict, key: str, model: str, timeout: float) -> dict:
+    result = _bocha_request("/v1/systemone", key, timeout,
+                            {"model": model, "state": state, "questions": questions})
+    answers = result.get("answers")
+    if not isinstance(answers, dict) or not all(name in answers for name in questions):
+        raise JevError("Bocha Jev 返回缺少判断答案")
+    return result
 
 
 def _answer(answer) -> dict:
@@ -205,6 +264,14 @@ def _check_openrouter_key(key: str, timeout: float) -> None:
 
 def list_models(provider: str, key: str, timeout: float = 10) -> list[str]:
     """某家能用的 Jev 模型 id，去重排序。失败抛 JevError（设置页直接显示这句话）。"""
+    if provider == "bocha":
+        result = _bocha_request("/v1/models", key, timeout)
+        models = result.get("data", [])
+        if not isinstance(models, list):
+            raise JevError("Bocha Jev 模型列表格式无效")
+        return sorted({name for item in models if isinstance(item, dict)
+                       for name in [item.get("id") or item.get("name")]
+                       if isinstance(name, str) and name})
     if provider == "typesafe":
         import typesafe_sdk
 
@@ -238,7 +305,7 @@ if __name__ == "__main__":
     os.environ.pop(JEV_ENV, None)
     os.environ["OPENROUTER_API_KEY"] = "or-key"  # 老名字：新名字没设时该退回它
     assert _api_key(JEV_ENV) == "or-key"
-    os.environ[JEV_ENV] = "ts-key"  # 新名字在就用新的，两家来源共用这一把
+    os.environ[JEV_ENV] = "ts-key"  # 新名字在就用新的，各来源共用这个配置槽
     questions = dict(JUDGE_QUESTIONS)
     questions.update(build_rank_question(["甲", "乙", "丙"]))
     seen: dict = {}
@@ -313,7 +380,7 @@ if __name__ == "__main__":
         return io.BytesIO(json.dumps(body).encode("utf-8"))
 
     with patch.object(urllib.request, "urlopen", _fake_urlopen):
-        assert ask({"chat": {}}, questions) == body
+        assert ask({"chat": {}}, questions, provider="openrouter") == body
     assert seen["url"] == OPENROUTER_DECISIONS
     assert seen["body"]["model"] == "typesafe/jev-1.13" and seen["body"]["questions"] == questions
 

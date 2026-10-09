@@ -19,7 +19,7 @@ _ROOT = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
 _CONFIG = os.path.join(_ROOT, "config.json")
 _DEFAULT_RELATIONSHIP = "romantic partners"
 _DEFAULT_CONTEXT = 10
-_DEFAULT_JEV = "openrouter"
+_DEFAULT_JEV = "bocha"
 _DEFAULT_DRAFT = "deepseek"
 
 
@@ -52,7 +52,7 @@ def language() -> str:
     return str(_read("lang") or "zh").strip().lower()
 
 def jev_provider() -> str:
-    """判断模型走哪家：openrouter（默认）或 typesafe 直连。"""
+    """判断模型走哪家：bocha（默认）、openrouter 或 typesafe 直连。"""
     v = _read("jev_provider")
     return v if v in JEV_PROVIDERS else _DEFAULT_JEV
 
@@ -136,7 +136,7 @@ def _notify_env() -> None:
         pass
 
 def jev_key() -> str:
-    """判断那把 key，两家来源共用。"""
+    """判断那把 key，所有 Jev 来源共用配置槽。"""
     return _get_key(JEV_ENV)
 
 def has_jev_key() -> bool:

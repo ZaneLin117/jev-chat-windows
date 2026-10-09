@@ -610,7 +610,7 @@ class Overlay:
         self._fetched.done.connect(self._models_fetched)
         self.jev = self._model_group(box, "判断 · Jev", "jev", providers.JEV_PROVIDERS)
         box.addWidget(self._hint(
-            "判断意图、紧张度，并给三条候选排序。两家给的是同一个 Jev，必填。"
+            "判断意图、紧张度，并给三条候选排序。可选 Bocha、OpenRouter 或 TypeSafe，必填。"
         ))
         self.draft = self._model_group(box, "起草 · 语言模型", "draft", providers.DRAFT_PROVIDERS)
         box.addWidget(self._hint(
@@ -688,7 +688,7 @@ class Overlay:
         group.keyEdit.returnPressed.connect(self._save)
         box.addWidget(group.keyEdit)
         box.addWidget(self._hint(
-            "OpenRouter 的 key 或 TypeSafe 的 key，看上面选的来源。" if kind == "jev"
+            "填写上面所选 Jev 服务商的 API 密钥。" if kind == "jev"
             else "上面选哪家就填哪家的 key；换来源重填一次，只存这一把。"))
         model_label = _tlabel("模型", 13)
         box.addWidget(model_label)
@@ -730,7 +730,9 @@ class Overlay:
         for group in (self.jev, self.draft):
             provider = self._provider_of(group)
             name = group.table[provider].name
-            configured = bool(group.stored_key())
+            saved_provider = (settings.jev_provider() if group.kind == "jev"
+                              else settings.draft_provider())
+            configured = bool(group.stored_key()) and provider == saved_provider
             bind(group.keyState, "已配置" if configured else "未配置")
             bind(group.keyEdit, "已配置，留空保留" if configured else
                  lambda name=name: T("输入 {name} API 密钥").format(name=name), "setPlaceholderText")
@@ -746,7 +748,9 @@ class Overlay:
         provider = self._provider_of(group)
         custom = group.kind == "draft" and provider in providers.CUSTOM
         base = self.baseEdit.text().strip() if custom else None
-        key = group.keyEdit.text().strip() or group.stored_key()
+        saved_provider = (settings.jev_provider() if group.kind == "jev"
+                          else settings.draft_provider())
+        key = group.keyEdit.text().strip() or (group.stored_key() if provider == saved_provider else "")
         if not key:
             bind(group.status, "先填密钥", "setText")
             return
@@ -867,7 +871,9 @@ class Overlay:
             return
         for group, provider in ((self.jev, jev_provider), (self.draft, draft_provider)):
             name = group.table[provider].name
-            if not group.keyEdit.text().strip() and not group.stored_key():
+            saved_provider = (settings.jev_provider() if group.kind == "jev"
+                              else settings.draft_provider())
+            if not group.keyEdit.text().strip() and not (provider == saved_provider and group.stored_key()):
                 self._settings_feedback(lambda group=group:
                                         T("请先填写 {name} 的 API 密钥。").format(name=T(group.keyTitle)), error=True)
                 group.keyEdit.setFocus()
