@@ -266,7 +266,7 @@ def list_models(provider: str, key: str, timeout: float = 10) -> list[str]:
     """某家能用的 Jev 模型 id，去重排序。失败抛 JevError（设置页直接显示这句话）。"""
     if provider == "bocha":
         result = _bocha_request("/v1/models", key, timeout)
-        models = result.get("data", [])
+        models = result.get("models", result.get("data", []))
         if not isinstance(models, list):
             raise JevError("Bocha Jev 模型列表格式无效")
         return sorted({name for item in models if isinstance(item, dict)
@@ -394,6 +394,11 @@ if __name__ == "__main__":
         assert list_models("openrouter", "or-key") == [
             "~typesafe/jev-latest", "typesafe/jev-1.13"]
     assert seen["key_url"] == OPENROUTER_KEY_URL
+
+    with patch(__name__ + "._bocha_request", return_value={"models": [
+            {"name": "bocha-jev-v1"}, {"name": "bocha-jev-latest"},
+            {"name": "bocha-jev-v1"}]}):
+        assert list_models("bocha", "bocha-key") == ["bocha-jev-latest", "bocha-jev-v1"]
 
     def _fake_key_rejected(req, timeout=None):
         raise urllib.error.HTTPError(OPENROUTER_KEY_URL, 401, "Unauthorized", {},
